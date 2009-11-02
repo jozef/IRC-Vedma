@@ -1,0 +1,250 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+xxx - desc
+
+=head1 SYNOPSIS
+
+=head1 DESCRIPTION
+
+=cut
+
+
+use strict;
+use warnings;
+
+use 5.010;
+
+use Getopt::Long;
+use Pod::Usage;
+use Path::Class 'file';
+use DateTime;
+use URI::Escape 'uri_escape';
+use IRC::Vedma::SPc;
+use HTTP::Cookies;
+use LWP::UserAgent::POE;
+use JSON::Util;
+use Data::Dumper;
+use Yahoo::Search;
+
+use POE;
+use POE::Component::IRC::State;
+use POE::Component::IRC::Plugin::AutoJoin;
+use POE::Component::IRC::Plugin::Logger;
+
+our %users = eval { %{JSON::Util->decode( file(IRC::Vedma::SPc->sharedstatedir, 'irc-vedma', 'users.json' )->stringify )} };
+my $useragent = LWP::UserAgent::POE->new(
+   cookie_jar => HTTP::Cookies->new(),
+);
+   
+exit main();
+
+sub main {
+	my $help;
+	GetOptions(
+		'help|h' => \$help,
+	) or pod2usage;
+	pod2usage if $help;
+	
+	POE::Session->create(
+		package_states => [
+			main => [ qw(_default _start irc_join irc_public irc_msg) ]
+		],
+		inline_states => {
+			message => \&process_message,
+		},
+	);
+	$poe_kernel->run();	
+
+	return 0;
+}
+
+sub _start {
+
+    my $irc = POE::Component::IRC::State->spawn(
+        Nick     => 'vedma',
+        Server   => 'irc.perl.org',
+		Port     => '6667',
+    );
+
+=cut
+
+    my $irc = POE::Component::IRC::State->spawn(
+        Nick     => 'ircperl',
+        Server   => 'localhost',
+		Port     => '6667',
+		Password => 'huh'
+    );
+
+=cut
+
+    $irc->plugin_add('AutoJoin', POE::Component::IRC::Plugin::AutoJoin->new(
+       Channels => [ '#hora' ]
+    ));
+	$irc->plugin_add('Logger', POE::Component::IRC::Plugin::Logger->new(
+		Path    => IRC::Vedma::SPc->logdir,
+		DCC     => 0,
+		Private => 0,
+		Public  => 1,
+	));
+ 
+    #$irc->yield(register => 'join');
+    $irc->yield( register => 'all' );
+    $irc->yield('connect');
+}
+
+sub irc_join {
+    my $nick = (split /!/, $_[ARG0])[0];
+
+    my $channel = $_[ARG1];
+    my $irc = $_[SENDER]->get_heap();
+    # only send the message if we were the one joining
+    if ($nick ne $irc->nick_name()) {
+        $irc->yield(privmsg => $channel, 'vitaj '.$nick);
+        
+        # make operator if known
+        my $nickid = $irc->nick_long_form($nick) || return;
+        $irc->yield( mode => $channel => '+o' => $nick )
+        	if ($users{$channel}->{$nickid}->{'operator'});
+    }
+    else {
+		$irc->yield(privmsg => $channel, 'dobrý deň');
+	}
+}
+
+sub irc_msg {
+    my ($sender, $who, $where, $what) = @_[SENDER, ARG0 .. ARG2];
+    my $irc = $sender->get_heap();
+	print STDERR 'irc_msg: ', $what, "\n";
+	$_[KERNEL]->yield('message', $who, $where, $what);
+}
+
+sub irc_public {
+    my ($sender, $who, $where, $what) = @_[SENDER, ARG0 .. ARG2];
+    my $irc = $sender->get_heap();
+	print STDERR 'irc_public: ', $what, "\n";
+	$_[KERNEL]->yield('message', $irc, $who, $where, $what);
+}
+
+sub process_message {
+    my ($irc, $who, $where, $what) = @_[ARG0 .. ARG3];
+    my $nick = ( split /!/, $who )[0];
+    my $channel = $where->[0];
+
+	return if not $what =~ /^([^ ]+)(?:\s+(.+))?$/;
+	my ($keyword, $text) = ($1, $2);
+
+	given ($keyword) {
+		when ('help') {
+			$irc->yield( privmsg => $channel => $nick.': rot13 $text' );
+			$irc->yield( privmsg => $channel => $nick.': (time|cas) [$timezone]' );
+			$irc->yield( privmsg => $channel => $nick.': (trust|ver) [$who]' );
+			$irc->yield( privmsg => $channel => $nick.': (untrust|never) [$who]' );
+			$irc->yield( privmsg => $channel => $nick.': (g|google) [$query]' );
+			$irc->yield( privmsg => $channel => $nick.': (y|yahoo) [$query]' );
+		};
+		when ('rot13') {
+			$text =~ tr[a-zA-Z][n-za-mN-ZA-M];
+			$irc->yield( privmsg => $channel => $nick.': '.$text );
+		};
+		when (['who', 'kto']) {
+			$irc->yield( privmsg => $channel => $nick.': '.$who );
+		};
+		when (['whois', 'ktoje']) {
+			$irc->yield( privmsg => $channel => $nick.': '.$irc->nick_long_form($text) );
+		};
+		when (['time', 'cas']) {
+			$text ||= 'CET';
+			$text = uc $text;
+			eval {
+				$irc->yield( privmsg => $channel => $nick.': '.DateTime->now()->set_time_zone($text).' '.$text );
+			};
+			if ($@) {
+				my $error = $@;
+				$error =~ s/\n/ /xmsg;
+				$irc->yield( privmsg => $channel => $nick.': sorry :-| ('.$error.')' );
+			}
+		};
+		when (['trust', 'ver']) {
+			if (not $irc->is_channel_operator($channel, $nick)) {
+				$irc->yield( privmsg => $channel => $nick.': do I know you?' );
+				return;
+			}
+			my $nickid = $irc->nick_long_form($text);
+			if (not $nickid) {
+				$irc->yield( privmsg => $channel => $nick.': not here...' );
+				return;				
+			}
+			$users{$channel}->{$nickid}->{'operator'} = 1; 
+			JSON::Util->encode(\%users, file(IRC::Vedma::SPc->sharedstatedir, 'irc-vedma', 'users.json' )->stringify );
+			$irc->yield( mode => $channel => '+o' => $text );
+		};
+		when (['untrust', 'never']) {
+			if (not $irc->is_channel_operator($channel, $nick)) {
+				$irc->yield( privmsg => $channel => $nick.': do I know you?' );
+				return;
+			}
+			my $nickid = ($text =~ m/!/ ? $text : $irc->nick_long_form($text));
+			if (not $nickid) {
+				$irc->yield( privmsg => $channel => $nick.': not here...' );
+				return;				
+			}
+			$users{$channel}->{$nickid}->{'operator'} = 0; 
+			JSON::Util->encode(\%users, file(IRC::Vedma::SPc->sharedstatedir, 'irc-vedma', 'users.json' )->stringify );
+			$irc->yield( mode => $channel => '-o' => $text );
+		};
+		when (['g', 'google']) {
+			if (not $text) {
+				$irc->yield( privmsg => $channel => $nick.': google what?' );
+				return;				
+			}
+			$text = uri_escape($text);
+			my $resp = $useragent->get( "http://ajax.googleapis.com/ajax/services/search/web?v=1.0&q=".$text );
+			
+			if($resp->is_success()) {
+				my $data = JSON::Util->decode($resp->content());
+				if (not $data or ($data->{responseStatus} ne '200')) {
+					$irc->yield( privmsg => $channel => $nick.': sorry :-| ('.$data->{responseStatus}.')' );
+					return;
+				}
+				foreach my $result (@{$data->{'responseData'}->{'results'}}) {
+					$irc->yield( privmsg => $channel => $nick.': [ '.$result->{'url'}.' ] '.$result->{'titleNoFormatting'} );
+				}
+    		} else {
+				$irc->yield( privmsg => $channel => $nick.': sorry :-| ('.$resp->message().')' );
+    		}
+		};
+		when (['y', 'yahoo']) {
+			if (not $text) {
+				$irc->yield( privmsg => $channel => $nick.': yahoo what?' );
+				return;				
+			}
+			my @results = Yahoo::Search->Results(Doc => $text, AppId => "YahooDemo", Count => 5);
+			foreach my $result (@results) {
+				$irc->yield( privmsg => $channel => $nick.': [ '.$result->{'DisplayUrl'}.' ] '.$result->{'Summary'} );
+			}
+		};
+		when ('join') {
+			$irc->yield( join => $text );
+		};
+	}
+    return;
+}
+
+# We registered for all events, this will produce some debug info.
+sub _default {
+    my ($event, $args) = @_[ARG0 .. $#_];
+    my @output = ( "$event: " );
+
+    for my $arg (@$args) {
+        if ( ref $arg eq 'ARRAY' ) {
+            push( @output, '[' . join(', ', @$arg ) . ']' );
+        }
+        else {
+            push ( @output, "'$arg'" );
+        }
+    }
+    print join ' ', @output, "\n";
+    return 0;
+}
